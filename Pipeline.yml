@@ -1,0 +1,340 @@
+#Pipeline Documentation: https://dev.azure.com/TfL-TechDev/DVS%202/_wiki/wikis/DVS-2.wiki?pagePath=/Architecture/Azure%20DevOps/Power%20Platform/Pipelines/Build%20Pipelines/BP%252DDVS%252DMSDYN365%252DCE%252DVER%252D01&wikiVersion=GBwikiMaster
+schedules:
+- cron: '0 1 * * *'
+  displayName: Daily midnight build
+  branches:
+    include:
+    - release-01
+variables:
+  displayName: Generate the solution version
+  MajorVersion: '5' 
+  Yy: $[format('{0:yy}', pipeline.startTime)]
+  Mm: $[format('{0:MM}', pipeline.startTime)]
+  Dd: $[format('{0:dd}', pipeline.startTime)]
+  Hh: $[format('{0:HHmm}', pipeline.startTime)]
+  VersionNumber: $(MajorVersion).$(YY).$(MM).$(DD)$(Hh)
+
+        
+jobs:
+- job: SetSolutionVersion
+  variables: 
+    - group: VG-DVS-MSDYN365-CE-DEV-01
+  pool:
+    vmImage: 'windows-latest'
+  steps: 
+  - task: MSCRMToolInstaller@12
+    displayName: Install the Power DevOps Tools
+    inputs:
+      nugetFeed: 'official'
+      psFeed: 'official'
+  - task: MSCRMSetVersion@12
+    displayName: PDT Set version
+    inputs:
+      target: 'crm'
+      crmConnectionString: 'AuthType=ClientSecret;Url=$(D365_OrganisationUrl);ClientId=$(ServicePrincipalId);ClientSecret=$(ServicePrincipalSecret)'
+      solutionName: 'DVS2'
+      versionNumber: '$(VersionNumber)'
+      
+      
+      #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END 
+      
+# Pipeline Documentation: https://dev.azure.com/TfL-TechDev/DVS%202/_wiki/wikis/DVS-2.wiki?pagePath=/Architecture/Azure%20DevOps/Power%20Platform/Pipelines/Build%20Pipelines/BP%252DDVS%252DMSDYN365%252DCE%252DCORE%252DREL%252DCl
+parameters:
+- name: SolutionName
+  displayName: Solution Name
+  type: string
+  default: 'Core'
+
+- name: OverrideAsyncWaitTimeoutInSecs
+  displayName: Deployment AsyncWaitTimeoutInSecs
+  type: number
+  default: 3200
+
+
+trigger:
+  branches:
+    include:
+      - release-01/*
+  paths:
+    include:
+    - 'src/Metadata/Solutions/Core/Managed/Core_Managed.zip'
+
+variables:
+- name: 'MainBranch'
+  value: 'refs/heads/main'
+  
+- name: 'SourcePath'
+  value: '$(Build.Repository.Name)\src\'
+
+- name: 'VersionMajor'
+  value: 1
+
+- name: 'IsPR'
+  value: $[eq(variables['Build.Reason'], 'PullRequest')]
+
+- name: 'RevisionNumber'
+  value: $[counter(format('{0}{1}{2}', '${{ parameters.SolutionName }})', variables['System.PullRequest.TargetBranch'], variables['Build.Reason']), 1)]
+
+- name: 'ArtifactNameForPackedSolutions'
+  value: 'Drop'
+
+- name: ArtifactPackageName
+  value: $[lower('${{ parameters.SolutionName }})')]
+
+stages:
+- stage: 'Build'
+  displayName: 'Build The Unmanaged And Managed Solutions Using SolutionPackager'
+  variables: 
+    - group: VG-DVS-MSDYN365-CE-DEV-01
+
+      
+  jobs: 
+  - job: 'Build'
+    displayName: 'Build Job'
+    pool:
+      vmImage: 'windows-2019'
+
+    steps:
+    - checkout: self
+
+    - task: CopyFiles@2
+      displayName: 'Copy Files To Drop Folder'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/src/Metadata/Solutions/Core/Managed'
+        Contents: '*.zip'
+        TargetFolder: 'Drop/Managed'
+
+    - task: CopyFiles@2
+      displayName: 'Copy Script Files To Drop Folder'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/AzurePipelines/Scripts'
+        Contents: '*.ps1'
+        TargetFolder: 'Drop/Scripts'
+
+    - task: CopyFiles@2
+      displayName: 'Copy Templates To Drop Folder'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/AzurePipelines/Templates'
+        Contents: '**'
+        TargetFolder: 'Drop/Templates'  
+
+    - publish: '$(ArtifactNameForPackedSolutions)'
+      displayName: 'Publish Packed Solutions'
+      artifact: '$(ArtifactNameForPackedSolutions)'
+    - task: MSCRMToolInstaller@12
+      inputs:
+        nugetFeed: 'official'
+        psFeed: 'official'
+
+   
+
+- stage: 'DevStage'  
+  displayName: 'Deploy To The DEV-01 Environment'
+  dependsOn: Build
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  variables:
+  - group: VG-DVS-MSDYN365-CE-DEV-01
+  jobs:
+  - template: Templates/Deploy-Crm-Solution-Jobs.yml
+  # Calling Template To Deploy Soluton In Dev Environment
+    parameters:
+      Environment: 'DVS-MSDYN365-CE-DEV-01'
+      EnvironmentID: $(D365_EnvironmentId)
+      SolutionName: '${{ parameters.SolutionName }}'
+      Solutionsuffix: '_Managed'
+      Artifactname: $(ArtifactNameForPackedSolutions)   
+      CrmConnectionString:  "AuthType=ClientSecret;Url=$(D365_OrganisationUrl);ClientId=$(ServicePrincipalId);ClientSecret=$(ServicePrincipalSecret)" 
+      SolutionPath: $(System.DefaultWorkingDirectory)/Drop/Managed/Core_Managed.zip
+      DeploymentPool: 
+        vmImage: 'windows-2019'      
+      AsyncWaitTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      CrmConnectionTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      PromptforManualIntervention: true
+
+- stage: 'SystemTestStage'  
+  displayName: 'Deploy To The ST-01 Environment'
+  dependsOn: DevStage
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  variables:
+  - group: VG-DVS-MSDYN365-CE-ST-01
+  jobs:
+  - template: Templates/Deploy-Crm-Solution-Jobs.yml
+  # Calling Template To Deploy Soluton In Test Environment
+    parameters:
+      Environment: 'DVS-MSDYN365-CE-ST-01'
+      EnvironmentID: $(D365_EnvironmentId)
+      SolutionName: '${{ parameters.SolutionName }}'
+      Solutionsuffix: '_Managed'
+      Artifactname: $(ArtifactNameForPackedSolutions)   
+      CrmConnectionString:  "AuthType=ClientSecret;Url=$(D365_OrganisationUrl);ClientId=$(ServicePrincipalId);ClientSecret=$(ServicePrincipalSecret)" 
+      SolutionPath: $(System.DefaultWorkingDirectory)/Drop/Managed/Core_Managed.zip
+      Deploymentpool: 
+        vmImage: 'windows-2019'      
+      AsyncWaitTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      CrmConnectionTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      PromptforManualIntervention: true
+- stage: 'EndtoEndStage'  
+  displayName: 'Deploy To The E2E-01 Environment'
+  dependsOn: SystemTestStage
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  variables:
+  - group: VG-DVS-MSDYN365-CE-E2E-01
+
+  jobs:
+  - template: Templates/Deploy-Crm-Solution-Jobs.yml
+  # Calling Template To Deploy Soluton In EE Environment
+    parameters:
+      Environment: 'DVS-MSDYN365-CE-E2E-01'
+      EnvironmentID: $(D365_EnvironmentId)
+      SolutionName: '${{ parameters.SolutionName }}'
+      Solutionsuffix: '_Managed'
+      Artifactname: $(ArtifactNameForPackedSolutions)   
+      CrmConnectionString:  "AuthType=ClientSecret;Url=$(D365_OrganisationUrl);ClientId=$(ServicePrincipalId);ClientSecret=$(ServicePrincipalSecret)"  
+      SolutionPath: $(System.DefaultWorkingDirectory)/Drop/Managed/Core_Managed.zip
+      Deploymentpool: 
+        vmImage: 'windows-2019'      
+      AsyncWaitTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      CrmConnectionTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      PromptforManualIntervention: true
+- stage: 'Uat'  
+  displayName: 'Deploy To The UAT-01 Environment'
+  dependsOn: EndtoEndStage
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  variables:
+  - group: VG-DVS-MSDYN365-CE-UAT-01
+  jobs:
+  - template: Templates/Deploy-Crm-Solution-Jobs.yml
+   # Calling Template To Deploy Soluton In UAT Environment
+    parameters:
+      Environment: 'DVS-MSDYN365-CE-UAT-01'
+      EnvironmentID: $(D365_EnvironmentId)
+      SolutionName: '${{ parameters.SolutionName }}'
+      Solutionsuffix: '_Managed'
+      Artifactname: $(ArtifactNameForPackedSolutions)   
+      CrmConnectionString:  "AuthType=ClientSecret;Url=$(D365_OrganisationUrl);ClientId=$(ServicePrincipalId);ClientSecret=$(ServicePrincipalSecret)" 
+      SolutionPath: $(System.DefaultWorkingDirectory)/Drop/Managed/Core_Managed.zip
+      Deploymentpool: 
+        vmImage: 'windows-2019'      
+      AsyncWaitTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      CrmConnectionTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      PromptforManualIntervention: true
+- stage: 'TrainingStage'  
+  displayName: 'Deploy To The TRN Environment'
+  dependsOn: EndtoEndStage
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  variables:
+  - group: VG-DVS-MSDYN365-CE-TRN-01
+  jobs:
+  - template: Templates/Deploy-Crm-Solution-Jobs.yml
+   # Calling template to deploy soluton in TRAINING environment
+    parameters:
+      Environment: 'DVS-MSDYN365-CE-TRN'
+      EnvironmentID: $(D365_EnvironmentId)
+      SolutionName: '${{ parameters.SolutionName }}'
+      Solutionsuffix: '_Managed'
+      Artifactname: $(ArtifactNameForPackedSolutions)   
+      CrmConnectionString:  "AuthType=ClientSecret;Url=$(D365_OrganisationUrl);ClientId=$(ServicePrincipalId);ClientSecret=$(ServicePrincipalSecret)"
+      SolutionPath: $(System.DefaultWorkingDirectory)/Drop/Managed/Core_Managed.zip
+      Deploymentpool: 
+        vmImage: 'windows-2019'      
+      AsyncWaitTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      CrmConnectionTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      PromptforManualIntervention: true
+- stage: 'PreProductionStage'  
+  displayName: 'Deploy To The PREPRD Environment'
+  dependsOn: EndtoEndStage
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  variables:
+  - group: VG-DVS-MSDYN365-CE-PREPRD
+
+  jobs:
+  - template: Templates/Deploy-Crm-Solution-Jobs.yml
+   # Calling Template To Deploy Soluton In PreProduction Environment
+    parameters:
+      Environment: 'DVS-MSDYN365-CE-PREPRD'
+      EnvironmentID: $(D365_EnvironmentId)
+      SolutionName: '${{ parameters.SolutionName }}'
+      Solutionsuffix: '_Managed'
+      Artifactname: $(ArtifactNameForPackedSolutions)   
+      CrmConnectionString:  "AuthType=ClientSecret;Url=$(D365_OrganisationUrl);ClientId=$(ServicePrincipalId);ClientSecret=$(ServicePrincipalSecret)"
+      SolutionPath: $(System.DefaultWorkingDirectory)/Drop/Managed/Core_Managed.zip
+      Deploymentpool: 
+        vmImage: 'windows-2019'      
+      AsyncWaitTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      CrmConnectionTimeoutInSecs: ${{ parameters.OverrideAsyncWaitTimeoutInSecs }}
+      PromptforManualIntervention: true
+      
+      
+      
+      
+      #  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  #END END END  END END END END END
+      
+      
+      
+      
+name: $(TeamProject)_$(BuildDefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+
+jobs:
+- job: ExtractMySolution
+  pool:
+    vmImage: 'windows-latest'
+  steps:
+  - task: PowerPlatformToolInstaller@2
+    inputs:
+      DefaultVersion: true
+  - task: CmdLine@2
+    inputs:
+      script: |
+        echo "Structure of work folder of this pipeline:"
+        tree $(Agent.WorkFolder)\1 /f
+        echo "Build.ArtifactStagingDirectory:" 
+        echo "$(Build.ArtifactStagingDirectory)"
+        echo "Build.BinariesDirectory:" 
+        echo "$(Build.BinariesDirectory)"
+        echo "Build.SourcesDirectory:"
+        echo "$(Build.SourcesDirectory)" 
+  - task: PowerShell@2
+    inputs:
+      targetType: 'inline'
+      script: |
+        $rootPath = "$(System.DefaultWorkingDirectory)"
+        
+        Get-ChildItem -Recurse -File $rootPath | ForEach-Object {
+            $filePath = $_.FullName
+            $relativePath = $_.FullName.Substring($rootPath.Length + 1)
+            $fileSize = $_.Length
+            $fileLastModified = $_.LastWriteTime
+
+            Write-Host "File Path: $relativePath"
+            Write-Host "File Size: $fileSize bytes"
+            Write-Host "Last Modified: $fileLastModified"
+            Write-Host "---------------------------"
+        } 
+  - task: PowerPlatformUnpackSolution@2
+    inputs: 
+      SolutionInputFile: 'src\Metadata\Solutions\DVS\Managed\Dvs_Managed.zip' 
+      SolutionTargetFolder: 'src\Metadata\Solutions\DVS\Managed\Extracted'
+      SolutionType: 'Managed'
+
+
+  - task: PowerShell@2
+    env:
+      system_accesstoken: $(System.AccessToken)
+    inputs:
+      targetType: 'inline'
+      script: |
+        git config --global user.name "$(Build.RequestedFor)"
+        git config --global user.email "$(Build.RequestedForEmail)"
+
+        echo ================================================================
+        git checkout -B $(Build.SourceBranchName) --track origin/$(Build.SourceBranchName)
+        git reset --hard origin/$(Build.SourceBranchName)
+   
+        echo ================================================================
+        git config core.autocrlf true
+        git add -A
+        git commit -m "$(Build.BuildNumber)" --allow-empty
+        git -c http.extraheader="AUTHORIZATION: bearer $env:SYSTEM_ACCESSTOKEN" push origin HEAD:$(Build.SourceBranchName)
+
